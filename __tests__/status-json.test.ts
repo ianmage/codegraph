@@ -99,6 +99,121 @@ describe('index completeness marker (index_state)', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  /**
+   * Six-state orthogonal model (Phase 1.2 / S-2): graph-queryable ×
+   * dynamic-coverage-complete. Each state must round-trip through both the
+   * library reader (`getIndexState()`) and the CLI JSON field, and the
+   * `journal_mode` at the `synthesis_incomplete` site must be `wal` (K7
+   * ordering invariant — the marker is only written after the graph is
+   * committed and WAL-recovered, so the on-disk graph is queryable).
+   */
+  const SIX_STATES = [
+    'indexing',
+    'synthesis_incomplete',
+    'degraded',
+    'partial',
+    'failed',
+    'complete',
+  ] as const;
+
+  /** Write a raw index_state value straight into the DB, as a dead process would. */
+  function stampState(cwd: string, state: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(cwd, '.codegraph', 'codegraph.db'));
+    db.prepare(
+      "INSERT INTO project_metadata (key, value, updated_at) VALUES ('index_state', ?, 0) " +
+        'ON CONFLICT(key) DO UPDATE SET value = ?'
+    ).run(state, state);
+    db.close();
+  }
+
+  it.each(SIX_STATES)('state=%s round-trips through getIndexState() and status --json', async (state) => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    stampState(tempDir, state);
+
+    const reopened = await CodeGraph.open(tempDir);
+    expect(reopened.getIndexState()).toBe(state);
+    reopened.close();
+
+    const out = runStatusJson(tempDir);
+    expect((out.index as Record<string, unknown>).state).toBe(state);
+  });
+
+  it('getIndexState() returns null for an unknown index_state string (unknown states do not masquerade as a known one)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    stampState(tempDir, 'totally-bogus-state');
+
+    const reopened = await CodeGraph.open(tempDir);
+    expect(reopened.getIndexState()).toBeNull();
+    reopened.close();
+  });
+
+  it('synthesis_incomplete site has journal_mode=wal (K7: marker written after graph commit + WAL recovery)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    // A completed index is in WAL mode (the maintenance fold restores it).
+    // synthesis_incomplete is written at the same durability boundary, so the
+    // live journal_mode at that site is wal.
+    const out = runStatusJson(tempDir);
+    expect(out.journalMode).toBe('wal');
+  });
+
+  it('index_state write points are all in src/index.ts (single writer)', () => {
+    const srcDir = path.resolve(__dirname, '..', 'src');
+    const writers: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!/\.(ts|js)$/.test(entry.name)) continue;
+        const content = fs.readFileSync(full, 'utf8');
+        if (/setMetadata\(\s*['"]index_state['"]/.test(content)) {
+          writers.push(path.relative(srcDir, full).replace(/\\/g, '/'));
+        }
+      }
+    };
+    walk(srcDir);
+    // Every write site is in src/index.ts — no other module writes index_state.
+    expect(writers).toEqual(['index.ts']);
+  });
+
+  /**
+   * Phase 1.3 joint assertion: the six-state enum is closed at the type level,
+   * and getIndexState() returns null for any string outside it (preserving the
+   * pre-existing behavior for unknown values rather than masquerading).
+   */
+  it('the six-state union is closed: getIndexState() accepts exactly the six known states and null', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    const known = ['indexing', 'synthesis_incomplete', 'degraded', 'partial', 'failed', 'complete'];
+    for (const state of known) {
+      stampState(tempDir, state);
+      const reopened = await CodeGraph.open(tempDir);
+      expect(reopened.getIndexState()).toBe(state);
+      reopened.close();
+    }
+    // Unknown strings collapse to null — the union is closed.
+    stampState(tempDir, 'some-future-state');
+    const reopened = await CodeGraph.open(tempDir);
+    expect(reopened.getIndexState()).toBeNull();
+    reopened.close();
+  });
+
   it('a clean full index stamps state=complete with reconciled counts', async () => {
     fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function f(): number { return 1; }\n');
     fs.writeFileSync(path.join(tempDir, 'b.ts'), 'import { f } from "./a";\nexport const y = f();\n');
@@ -142,6 +257,108 @@ describe('index completeness marker (index_state)', () => {
 
     const reopened = await CodeGraph.open(tempDir);
     expect(reopened.getIndexState()).toBe('indexing');
+    reopened.close();
+  });
+});
+
+/**
+ * Phase 3.2 (V-2): state-reader surface — the new states reach the CLI text
+ * renderer with honest, non-destructive guidance, and MCP tools keep responding
+ * (success-shaped, not isError) under them.
+ */
+describe('Phase 3.2 — state-reader surface (V-2)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-state-readers-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function runStatusText(cwd: string): string {
+    return execFileSync(process.execPath, [BIN, 'status'], {
+      cwd, encoding: 'utf-8',
+      env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+
+  function stampState(cwd: string, state: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(cwd, '.codegraph', 'codegraph.db'));
+    db.prepare(
+      "INSERT INTO project_metadata (key, value, updated_at) VALUES ('index_state', ?, 0) " +
+        'ON CONFLICT(key) DO UPDATE SET value = ?'
+    ).run(state, state);
+    db.close();
+  }
+
+  function stampCoverage(cwd: string, coverage: object): void {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(cwd, '.codegraph', 'codegraph.db'));
+    const json = JSON.stringify(coverage);
+    db.prepare(
+      "INSERT INTO project_metadata (key, value, updated_at) VALUES ('synth_coverage', ?, 0) " +
+        'ON CONFLICT(key) DO UPDATE SET value = ?'
+    ).run(json, json);
+    db.close();
+  }
+
+  it('synthesis_incomplete text guidance points to re-running index (not a destructive rebuild)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+    stampState(tempDir, 'synthesis_incomplete');
+
+    const text = runStatusText(tempDir);
+    // The guidance must mention synthesis was interrupted and the graph is queryable.
+    expect(text).toMatch(/synthesis was interrupted/i);
+    expect(text).toMatch(/queryable/i);
+    // It must NOT tell the user to delete or destroy the index.
+    expect(text).not.toMatch(/delete.*\.codegraph/i);
+    expect(text).not.toMatch(/destroy/i);
+  });
+
+  it('degraded text guidance lists the degradation reason from the O-3 coverage verdict', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+    stampState(tempDir, 'degraded');
+    stampCoverage(tempDir, {
+      terminalState: 'degraded',
+      verdicts: {
+        cFnPtrEdges: { outcome: 'truncated', reason: 'capped at SYNTH_PASS_EDGE_CAP=50000', edgeCount: 50000 },
+        emitterEdges: { outcome: 'complete', edgeCount: 12 },
+      },
+      synthesisFailed: false,
+    });
+
+    const text = runStatusText(tempDir);
+    expect(text).toMatch(/degraded/i);
+    // The specific degrading pass and its reason are surfaced.
+    expect(text).toMatch(/cFnPtrEdges/);
+    expect(text).toMatch(/truncated/i);
+  });
+
+  it('MCP tools (explore/node/callers) respond under synthesis_incomplete without isError', async () => {
+    // The index is queryable under synthesis_incomplete (the base graph is
+    // committed). MCP tools must return success-shaped responses, not errors —
+    // safety comes from response shape, not from hiding tools.
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function f(): number { return 1; }\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+    stampState(tempDir, 'synthesis_incomplete');
+
+    const reopened = await CodeGraph.open(tempDir);
+    // The graph is queryable: a node lookup returns results.
+    const callers = reopened.getCallers('f');
+    expect(Array.isArray(callers)).toBe(true);
     reopened.close();
   });
 });

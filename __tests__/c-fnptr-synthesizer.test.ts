@@ -21,6 +21,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
+import { affordability, type HeapFacts } from '../src/resolution/heap-budget';
 
 describe('c-fnptr dispatch synthesizer', () => {
   let dir: string;
@@ -432,5 +433,68 @@ void setup(int *L) {
     for (let i = 1; i < fractions.length; i++) {
       expect(fractions[i]!).toBeGreaterThanOrEqual(fractions[i - 1]!);
     }
+  });
+});
+
+/**
+ * Phase 2.3 (O-2): cFnPtr admission authorized by the paying isolate, not the
+ * host. The admission site (c-fnptr-synthesizer.ts) now calls
+ * `affordability(fullCacheCap * 24_576)` and takes the 128 fallback when the
+ * isolate's headroom is insufficient — even if the host is idle-empty (the
+ * #1212 defect: host freemem×0.5 = 71.9GB ≥ 2.09GB full-cache → accepted; the
+ * isolate then OOM'd).
+ */
+describe('Phase 2.3 — cFnPtr admission via isolate authorization', () => {
+  // The UE5 incident numbers (from the task's measured basis):
+  //   fullCacheCap = ceil(86289 × 1.05) + 512 = 91116
+  //   full-cache retention = 91116 × 24576 B = 2.09 GiB
+  //   host freemem×0.5 = 71.9 GiB (the defective acceptance)
+  const UE5_FILES = 86289;
+  const fullCacheCap = Math.ceil(UE5_FILES * 1.05) + 512; // 91116
+  const fullCacheBytes = fullCacheCap * 24_576; // ~2.09 GiB
+
+  it('UE5 scale + default-limit isolate facts ⇒ full cache refused (cacheCap falls back to 128)', () => {
+    // A default-limit isolate (~4.3GB heap_size_limit) with a realistic live
+    // set mid-index. Headroom is well under the 2.09GB full-cache request.
+    const defaultLimit: HeapFacts = {
+      limitBytes: 4288 * 1024 * 1024, // 4288 MB — the machine's pre-derivation default
+      liveBytes: 2_800_000_000,        // ~2.8GB already live mid-index
+      totalBytes: 3_000_000_000,
+      isolateKind: 'main',
+    };
+    const v = affordability(fullCacheBytes, defaultLimit);
+    // The isolate cannot afford the 2.09GB retention → refused → cacheCap = 128.
+    expect(v.affordable).toBe(false);
+    expect(v.reason).toBe('insufficient-headroom');
+    // The OLD host-memory check would have accepted: 71.9GB ≥ 2.09GB.
+    const hostFreememHalf = 71.9 * 1e9;
+    expect(hostFreememHalf).toBeGreaterThanOrEqual(fullCacheBytes);
+  });
+
+  it('ample isolate headroom ⇒ full cache accepted (cacheCap === fullCacheCap, capability not mis-throttled)', () => {
+    // An isolate with a raised limit and low live set can afford the full cache.
+    const ample: HeapFacts = {
+      limitBytes: 12 * 1e9,  // 12GB limit
+      liveBytes: 1 * 1e9,     // 1GB live → 11GB headroom
+      totalBytes: 2 * 1e9,
+      isolateKind: 'main',
+    };
+    const v = affordability(fullCacheBytes, ample);
+    expect(v.affordable).toBe(true);
+    expect(v.reason).toBe('ok');
+    // cacheCap would be fullCacheCap (the non-128 branch).
+    expect(v.headroomBytes).toBeGreaterThanOrEqual(fullCacheBytes);
+  });
+
+  it('c-fnptr-synthesizer.ts no longer imports memory-budget.ts (S-1/A1: host-capacity domain removed)', () => {
+    const src = fs.readFileSync(
+      path.resolve(__dirname, '..', 'src', 'resolution', 'c-fnptr-synthesizer.ts'),
+      'utf8'
+    );
+    // The host-capacity import is gone; the isolate-authority import is present.
+    expect(src).not.toMatch(/from\s+['"][^'"]*memory-budget['"]/);
+    expect(src).toMatch(/from\s+['"][^'"]*heap-budget['"]/);
+    // And the old host-memory admission expression is gone.
+    expect(src).not.toMatch(/memoryBudgetBytes\(\)\s*\*\s*0\.5/);
   });
 });

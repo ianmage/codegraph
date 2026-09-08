@@ -85,7 +85,7 @@ import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { memoryBudgetBytes } from './memory-budget';
+import { affordability } from './heap-budget';
 import { LRUCache } from './lru-cache';
 import { stripCommentsForRegex } from './strip-comments';
 import { getKernel } from '../extraction/kernel/loader';
@@ -480,7 +480,21 @@ export async function cFnPointerDispatchEdges(
   // headers) join the working set mid-pass. Pass-scoped transient, freed on
   // return.
   const fullCacheCap = Math.ceil(files.length * 1.05) + 512;
-  const cacheCap = memoryBudgetBytes() * 0.5 >= fullCacheCap * 24_576 ? fullCacheCap : 128;
+  // Admission is authorized by the PAYING ISOLATE (heap-budget.ts
+  // affordability), not the host's free memory. The host can be idle-empty
+  // (huge memoryBudgetBytes) while this isolate's headroom is exhausted — that
+  // mismatch is the #1212 OOM root cause. affordability deducts the current
+  // live set; if the isolate can't afford the full-cache retention (~24KB per
+  // stripped file), fall back to the within-stage-locality 128. All-or-nothing
+  // is preserved: a partial LRU thrashes to ~0% cross-sweep hit rate.
+  // Admission is authorized by the PAYING ISOLATE (heap-budget.ts
+  // affordability), not the host's free memory. The host can be idle-empty
+  // (huge memoryBudgetBytes) while this isolate's headroom is exhausted — that
+  // mismatch is the #1212 OOM root cause. affordability deducts the current
+  // live set; if the isolate can't afford the full-cache retention (~24KB per
+  // stripped file), fall back to the within-stage-locality 128. All-or-nothing
+  // is preserved: a partial LRU thrashes to ~0% cross-sweep hit rate.
+  const cacheCap = affordability(fullCacheCap * 24_576).affordable ? fullCacheCap : 128;
   const rawCache = new LRUCache<string, string | null>(Math.min(cacheCap, 4096));
   const raw = (file: string): string | null => {
     if (rawCache.has(file)) return rawCache.get(file)!;

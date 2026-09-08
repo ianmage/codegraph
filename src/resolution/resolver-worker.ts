@@ -45,6 +45,11 @@ type InMessage =
   | { type: 'close' };
 
 let dbPath: string | null = null;
+// Aggregate per-chunk resolve timing into one summary at close, rather than a
+// line per chunk (thousands on an 8M-ref index).
+let resolveChunks = 0;
+let resolveRefs = 0;
+let resolveMs = 0;
 
 port.on('message', (msg: InMessage) => {
   try {
@@ -87,7 +92,12 @@ port.on('message', (msg: InMessage) => {
         if (!resolver) throw new Error('resolver-worker: resolve before open');
         const tRes = Date.now();
         const out = resolver.resolveListForAdmission(msg.refs);
-        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+          const dt = Date.now() - tRes;
+          resolveChunks++;
+          resolveRefs += msg.refs.length;
+          resolveMs += dt;
+        }
         port.postMessage({ type: 'result', id: msg.id, ...out });
         break;
       }
@@ -105,7 +115,11 @@ port.on('message', (msg: InMessage) => {
         void (async () => {
           const t0 = Date.now();
           try {
-            const edges = await pass.run(q, r.getResolutionContext(), createYielder());
+            const edges = await pass.run(
+              q,
+              r.getResolutionContext(),
+              createYielder()
+            );
             port.postMessage({ type: 'synth-result', id: msg.id, edges, ms: Date.now() - t0 });
           } catch (err) {
             port.postMessage({
@@ -118,6 +132,9 @@ port.on('message', (msg: InMessage) => {
         break;
       }
       case 'close': {
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS && resolveChunks > 0) {
+          console.error(`[pool-timing] worker#${threadId} resolve: ${resolveChunks} chunks ${resolveRefs} refs in ${resolveMs}ms`);
+        }
         try {
           resolver?.dumpResolveProfile(`worker#${threadId}`);
         } catch { /* diagnostics never block shutdown */ }

@@ -20,7 +20,8 @@ import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCall
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
-import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { synthesizeCallbackEdges, SYNTH_PROGRESS_STEPS } from './callback-synthesizer';
+import { CoverageVerdict } from './coverage-verdict';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
@@ -217,6 +218,11 @@ export class ReferenceResolver {
   // same reason as deferredChainRefs and drained by
   // resolveDeferredThisMemberRefs once implements/extends edges exist (#808).
   private deferredThisMemberRefs: UnresolvedRef[] = [];
+  // V-1 (Phase 3.1): the coverage verdict from the last synthesis run. Read by
+  // src/index.ts to label the index honestly (complete vs degraded) — a
+  // synthesis that left a truncated/failed/skipped(at-scale) pass must NOT be
+  // labeled `complete` (E8 closure). Null before the first synthesis run.
+  lastSynthCoverage: CoverageVerdict | null = null;
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -399,6 +405,7 @@ export class ReferenceResolver {
     this.supertypeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
+    this.razorUsingsCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
@@ -1532,7 +1539,16 @@ export class ReferenceResolver {
        *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
       refIndexLoad?: { begin: () => void; end: () => void | Promise<void> };
       backpressure?: () => Promise<void> | null;
-    }
+    },
+    // K7 (Phase 4.2): invoked ONCE, immediately before dynamic-dispatch
+    // synthesis begins — i.e. AFTER the base graph (nodes + static edges +
+    // resolved references) is committed and WAL-recovered. The caller
+    // (src/index.ts) uses it to stamp `index_state = synthesis_incomplete`,
+    // so a kill during synthesis leaves a marker over a queryable, durable
+    // graph (reusable via re-run synthesis) rather than `indexing` (which
+    // would trigger a full rebuild). The single-writer invariant (I9) is
+    // preserved: the write happens in src/index.ts via this callback, not here.
+    onSynthesisStart?: () => void
   ): Promise<ResolutionResult> {
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
@@ -1566,6 +1582,11 @@ export class ReferenceResolver {
       unresolved: 0,
       byMethod: {} as Record<string, number>,
     };
+    // Aggregate per-batch timing into one summary at loop end, rather than a
+    // line per batch (thousands on an 8M-ref index).
+    let batchCount = 0;
+    let batchSettleMs = 0;
+    let batchPersistMs = 0;
 
     // Parallel pool, started immediately but never awaited up front: early
     // batches run sequentially while the workers boot (module load + readonly
@@ -1725,7 +1746,10 @@ export class ReferenceResolver {
 
       const tBatch = Date.now();
       const result = await settleBatch(inFlight, batch);
-      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] batch ${inFlight.mode}: ${batch.length} refs in ${Date.now() - tBatch}ms`);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+        batchCount++;
+        batchSettleMs += Date.now() - tBatch;
+      }
       lp('settle', tBatch);
 
       // Adaptive pool engagement: the fixed ref-count gate can't see PER-REF
@@ -1852,7 +1876,7 @@ export class ReferenceResolver {
       }
       lp('marks', tLp);
 
-      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] batch persist: ${Date.now() - tPersist}ms`);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) batchPersistMs += Date.now() - tPersist;
 
       // Aggregate stats
       aggregateStats.total += result.stats.total;
@@ -1909,6 +1933,9 @@ export class ReferenceResolver {
       batch = nextBatch;
       inFlight = nextInFlight;
     }
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && batchCount > 0) {
+      console.error(`[pool-timing] batches: ${batchCount} settle=${batchSettleMs}ms persist=${batchPersistMs}ms`);
+    }
     } finally {
       // Recreate the edge indexes BEFORE synthesis (kind-keyed reads) and on
       // any error path. A crash before this line is healed by the next
@@ -1933,22 +1960,75 @@ export class ReferenceResolver {
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
     // synthesize observer/callback dispatch edges (dispatcher → registered
     // callbacks) that static parsing leaves out. Best-effort — never fail the
-    // index on it. The pool (when it survived resolution) is REUSED to fan the
-    // independent passes across its read-only workers — that's why its destroy
-    // lives in the finally below, after synthesis, not at the end of the batch
-    // loop. See docs/design/callback-edge-synthesis.md.
+    // index on it. Resolution caches are dead weight from this boundary onward.
+    // Clear the main resolver and REPLACE (not merely clear) a surviving pool:
+    // UE5 proved that dropping references left ~17GB of committed worker-heap
+    // pages in the process, and cFnPtr then failed a large allocation at only
+    // ~1.7GB live. Fresh workers completed the same full-cache pass and exact
+    // five-pass concurrency control. Worker exit is the boundary that returns
+    // those committed pages to the OS before synthesis starts.
+    this.clearCaches();
+    if (pool) {
+      await pool.destroy().catch(() => undefined);
+      pool = null;
+      poolReady = false;
+      if (parallel) {
+        const freshPool = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
+        if (freshPool) {
+          try {
+            await freshPool.ready();
+            pool = freshPool;
+            poolReady = true;
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error('[pool-timing] fresh synthesis pool ready');
+            }
+          } catch (err) {
+            logDebug('Fresh synthesis pool failed; falling back to the main thread', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+            await freshPool.destroy().catch(() => undefined);
+          }
+        }
+      }
+    }
+
+    // K7: mark synthesis_incomplete BEFORE synthesis begins. The base graph is
+    // committed at this point (nodes + static edges + resolved references +
+    // WAL fold). A kill during synthesis leaves this marker over a queryable,
+    // durable graph — re-run performs synthesis only (no re-scan/re-parse).
+    onSynthesisStart?.();
     const tSynth = Date.now();
+    // V-1 (Phase 3.1): the coverage collector is threaded into synthesis so
+    // every pass outcome (complete/truncated/skipped/failed, incl. a thrown
+    // pass) is recorded. The catch below no longer SWALLOWS — a synthesis-
+    // level failure is recorded via recordSynthesisFailure, and the index
+    // still succeeds (C2: synthesis is additive). The terminal verdict is
+    // read by src/index.ts to label the index honestly (E8 closure).
+    const synthCoverage = new CoverageVerdict();
     try {
       aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
         this.queries,
         this.context,
         onSynthesisProgress,
         pool,
-        parallel?.backpressure
+        parallel?.backpressure,
+        synthCoverage
       );
-    } catch {
-      // synthesis is additive and optional; ignore failures
+    } catch (err) {
+      // Synthesis-level failure (not a single pass): record it and continue.
+      // The index is still successful — synthesis is additive (C2). The
+      // coverage verdict will read `degraded` so the index is labeled honestly.
+      synthCoverage.recordSynthesisFailure(
+        `synthesis threw: ${err instanceof Error ? err.message : String(err)}`
+      );
+      // Persist the verdict even on the throw path — the passes that did
+      // complete recorded their outcomes before the throw.
+      try {
+        synthCoverage.persist((key, value) => this.queries.setMetadata(key, value));
+      } catch { /* metadata is advisory */ }
     }
+    // Stash the terminal verdict for src/index.ts to read when labeling.
+    this.lastSynthCoverage = synthCoverage;
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] callback-synthesis: ${Date.now() - tSynth}ms`);
     } finally {
       if (pool) await pool.destroy().catch(() => undefined);
@@ -1965,6 +2045,34 @@ export class ReferenceResolver {
       unresolved: [],
       stats: aggregateStats,
     };
+  }
+
+  /**
+   * M-3 (Phase 4.2): re-run ONLY the dynamic-dispatch synthesis, reusing the
+   * SAME `synthesizeCallbackEdges` code path as `resolveAndPersistBatched`
+   * (D5 — no second code path). Called when `index_state` is
+   * `synthesis_incomplete`: the base graph (nodes + static edges + resolved
+   * references) is already committed and queryable; only synthesis was
+   * interrupted. Does NOT re-scan, re-parse, or re-resolve.
+   *
+   * The coverage verdict is threaded through exactly as in the full path, so
+   * the terminal state is labeled honestly (complete vs degraded) on rerun.
+   */
+  async rerunSynthesis(
+    onSynthesisProgress?: (done: number, total: number) => void
+  ): Promise<number> {
+    const synthCoverage = new CoverageVerdict();
+    onSynthesisProgress?.(0, SYNTH_PROGRESS_STEPS);
+    const count = await synthesizeCallbackEdges(
+      this.queries,
+      this.context,
+      onSynthesisProgress,
+      undefined, // no pool on rerun — synthesis runs on the main thread
+      undefined, // no WAL backpressure on rerun
+      synthCoverage
+    );
+    this.lastSynthCoverage = synthCoverage;
+    return count;
   }
 
   /**

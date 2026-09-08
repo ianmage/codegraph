@@ -31,6 +31,7 @@
  * too.
  */
 import { spawnSync } from 'child_process';
+import { derivedCeiling, memoryBudgetBytes } from '../resolution/heap-budget';
 
 /**
  * The V8 flag(s) that keep tree-sitter grammar compilation off the turboshaft
@@ -66,6 +67,41 @@ export function nodeRuntimeFlagsFor(nodeVersion: string): readonly string[] {
 export const NODE_RUNTIME_FLAGS: readonly string[] = nodeRuntimeFlagsFor(process.versions.node);
 
 /**
+ * M-2 (Phase 4.1): the hard backstop for the derived V8 heap ceiling, used when
+ * no cgroup limit is probeable (uncontained hosts). 8 GiB is a safe ceiling for
+ * typical dev machines — above the Node default (~4.3 GiB on this class of
+ * machine, which was never raised and never recorded, E7's cause) but below the
+ * point where V8 would grow past OS limits on a constrained host. In a cgroup-
+ * bounded container the derived ceiling never exceeds the cgroup limit (K2), so
+ * this hard cap only applies on uncontained hosts.
+ */
+const HEAP_CEILING_HARD_CAP_BYTES = 8 * 1024 * 1024 * 1024;
+
+/**
+ * Derive the `--max-old-space-size` value (in MiB) for the current environment.
+ * cgroup-aware + hard-clamped via {@link derivedCeiling}. Returns null when the
+ * derived value can't be computed or is non-positive (caller omits the flag).
+ *
+ * The value is in MEBIBYTES because `--max-old-space-size` takes MiB, not bytes.
+ * Delivered via command line/env (G4: `setFlagsFromString` is ineffective at
+ * runtime), riding the existing re-exec contract — no extra process layer.
+ */
+export function derivedHeapCeilingMib(): number | null {
+  const d = derivedCeiling(memoryBudgetBytes(), HEAP_CEILING_HARD_CAP_BYTES);
+  const mib = Math.floor(d.ceilingBytes / (1024 * 1024));
+  return mib > 0 ? mib : null;
+}
+
+/**
+ * The `--max-old-space-size=<N>` flag string, or null if derivation failed.
+ * Pure wrapper over {@link derivedHeapCeilingMib} so tests can pin the shape.
+ */
+export function heapCeilingFlag(): string | null {
+  const mib = derivedHeapCeilingMib();
+  return mib === null ? null : `--max-old-space-size=${mib}`;
+}
+
+/**
  * Env var set on the relaunched child so a detection slip can never cause an
  * infinite re-exec loop. Also lets users force-disable the relaunch.
  */
@@ -95,6 +131,13 @@ export function processHasWasmRuntimeFlags(
  * Build the argv for re-execing node with the WASM runtime flags: our flags
  * first, then any node flags already in `execArgv` (deduped), then the script
  * and its args. Pure — exported for unit testing.
+ *
+ * M-2 (Phase 4.1): the derived `--max-old-space-size` flag is appended when
+ * derivation succeeds. It is deliberately NOT part of the
+ * {@link processHasWasmRuntimeFlags} re-exec gate: the ceiling is a *derived*
+ * value that varies with the live environment, so gating on it would re-exec
+ * forever. The gate stays on the static `--liftoff-only` flag; the ceiling
+ * rides along on the single re-exec that the gate already triggers.
  */
 export function buildRelaunchArgv(
   scriptPath: string,
@@ -102,9 +145,13 @@ export function buildRelaunchArgv(
   execArgv: readonly string[] = process.execArgv
 ): string[] {
   const preserved = execArgv.filter(
-    (arg) => !WASM_RUNTIME_FLAGS.includes(arg) && !NODE_RUNTIME_FLAGS.includes(arg)
+    (arg) => !WASM_RUNTIME_FLAGS.includes(arg)
+      && !NODE_RUNTIME_FLAGS.includes(arg)
+      && !arg.startsWith('--max-old-space-size=')
   );
-  return [...NODE_RUNTIME_FLAGS, ...WASM_RUNTIME_FLAGS, ...preserved, scriptPath, ...scriptArgs];
+  const ceiling = heapCeilingFlag();
+  const flags = ceiling ? [...NODE_RUNTIME_FLAGS, ...WASM_RUNTIME_FLAGS, ceiling] : [...NODE_RUNTIME_FLAGS, ...WASM_RUNTIME_FLAGS];
+  return [...flags, ...preserved, scriptPath, ...scriptArgs];
 }
 
 /**

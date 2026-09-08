@@ -639,7 +639,12 @@ export class CodeGraph {
                 total: totalPasses,
               });
             },
-            walValve ? () => walValve!.backpressure() : undefined
+            walValve ? () => walValve!.backpressure() : undefined,
+            // K7: stamp synthesis_incomplete right before synthesis begins
+            // (the base graph is committed + WAL-recovered at this point).
+            () => {
+              try { this.queries.setMetadata('index_state', 'synthesis_incomplete'); } catch { /* advisory */ }
+            }
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
 
@@ -716,7 +721,19 @@ export class CodeGraph {
                 code: 'index_partial',
               });
             } else {
-              this.queries.setMetadata('index_state', 'complete');
+              // No file shortfall. Consult the synthesis coverage verdict
+              // (O-3, threaded in by resolution/index.ts): if any pass left a
+              // non-`complete` outcome (truncated/skipped-at-scale/failed) or
+              // synthesis threw, the index is `degraded`, not `complete` (E8
+              // closure — a synthesis that silently dropped coverage must not
+              // be labeled complete). File-gap partiality already took
+              // precedence above.
+              const synthVerdict = this.resolver.lastSynthCoverage?.project();
+              if (synthVerdict && synthVerdict.terminalState === 'degraded') {
+                this.queries.setMetadata('index_state', 'degraded');
+              } else {
+                this.queries.setMetadata('index_state', 'complete');
+              }
               if (discovered !== undefined) {
                 this.queries.setMetadata('index_files_discovered', String(discovered));
                 this.queries.setMetadata('index_files_accounted', String(accounted));
@@ -1154,19 +1171,81 @@ export class CodeGraph {
   }
 
   /**
-   * Completeness of the last full index run. `'complete'` is the only good
-   * state. `'indexing'` after the fact means a run was killed mid-index (OOM,
-   * SIGKILL, liveness watchdog) and the on-disk index is truncated;
-   * `'partial'` means the run finished but silently dropped files
-   * (discovered > indexed+skipped+errored); `'failed'` means it reported
-   * failure. `null` = index predates this marker. Surfaced by
-   * `codegraph status`.
+   * Completeness of the last full index run — an orthogonal two-axis model
+   * (graph-queryable × dynamic-coverage-complete), not an ordered scalar.
+   *
+   * - `'complete'` — graph fully queryable AND dynamic-dispatch synthesis ran
+   *   to completion with no truncated/failed/skipped(at-scale) pass.
+   * - `'synthesis_incomplete'` — the base graph (nodes + static edges +
+   *   resolved references) is committed and queryable, but synthesis was
+   *   interrupted (OOM/SIGKILL) before it finished. The graph is REUSABLE:
+   *   a re-run performs synthesis only, no re-scan/re-parse/re-resolve.
+   *   Written AFTER the graph commit + WAL recovery (K7 ordering invariant).
+   * - `'degraded'` — the run finished, but synthesis left at least one
+   *   non-`complete` pass verdict (truncated / skipped-at-scale / failed),
+   *   so dynamic-dispatch coverage is knowingly incomplete. The index is
+   *   queryable; the degradation reason is readable via `status`.
+   * - `'partial'` — the run finished but silently dropped files
+   *   (discovered > indexed+skipped+errored). File-gap partiality takes
+   *   precedence over coverage verdicts.
+   * - `'indexing'` — a run was killed mid-index (OOM, SIGKILL, liveness
+   *   watchdog) BEFORE the graph commit; the on-disk index is truncated.
+   *   Requires a full rebuild.
+   * - `'failed'` — the run reported failure.
+   * - `null` — index predates this marker.
+   *
+   * Surfaced by `codegraph status`.
    */
-  getIndexState(): 'indexing' | 'complete' | 'partial' | 'failed' | null {
+  getIndexState():
+    | 'indexing'
+    | 'synthesis_incomplete'
+    | 'degraded'
+    | 'partial'
+    | 'failed'
+    | 'complete'
+    | null {
     const raw = this.queries.getMetadata('index_state');
-    return raw === 'indexing' || raw === 'complete' || raw === 'partial' || raw === 'failed'
+    return raw === 'indexing' ||
+      raw === 'synthesis_incomplete' ||
+      raw === 'degraded' ||
+      raw === 'partial' ||
+      raw === 'failed' ||
+      raw === 'complete'
       ? raw
       : null;
+  }
+
+  /**
+   * The synthesis coverage verdict from the last index run (O-3), or null when
+   * no synthesis has run (predates the marker, or a fresh init). Read by
+   * `codegraph status` to render the `degraded` reason honestly — which pass
+   * was truncated/skipped/failed, and why. V-2 (Phase 3.2).
+   */
+  getSynthCoverage(): { terminalState: 'complete' | 'degraded'; reason: string | null } | null {
+    const raw = this.queries.getMetadata('synth_coverage');
+    if (!raw) return null;
+    try {
+      const p = JSON.parse(raw) as {
+        terminalState: 'complete' | 'degraded';
+        verdicts: Record<string, { outcome: string; reason?: string; skipReason?: string }>;
+        synthesisFailed?: boolean;
+        synthesisFailureReason?: string;
+      };
+      if (p.terminalState !== 'degraded') return { terminalState: 'complete', reason: null };
+      // Summarize the degrading passes into a human-readable reason.
+      const reasons: string[] = [];
+      if (p.synthesisFailed && p.synthesisFailureReason) {
+        reasons.push(`synthesis failed: ${p.synthesisFailureReason}`);
+      }
+      for (const [name, v] of Object.entries(p.verdicts)) {
+        if (v.outcome === 'complete') continue;
+        if (v.outcome === 'skipped' && v.skipReason === 'gated') continue;
+        reasons.push(`${name}: ${v.outcome}${v.reason ? ` (${v.reason})` : ''}`);
+      }
+      return { terminalState: 'degraded', reason: reasons.join('; ') || 'synthesis incomplete' };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1233,7 +1312,10 @@ export class CodeGraph {
     // resolution is timer-driven passive checkpoints, which the pool's
     // continuous reads keep perpetually partial — the WAL then accretes the
     // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
-    backpressure?: () => Promise<void> | null
+    backpressure?: () => Promise<void> | null,
+    // K7: invoked immediately before synthesis (after the base graph is
+    // committed). src/index.ts stamps `synthesis_incomplete` here.
+    onSynthesisStart?: () => void
   ): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
@@ -1251,7 +1333,21 @@ export class CodeGraph {
         end: () => this.db.endBulkRefLoad(),
       },
       backpressure,
-    });
+    }, onSynthesisStart);
+  }
+
+  /**
+   * M-3 (Phase 4.2): re-run ONLY dynamic-dispatch synthesis. Called when the
+   * index is `synthesis_incomplete` — the base graph is committed and
+   * queryable, only synthesis was interrupted. Does NOT re-scan, re-parse,
+   * re-resolve, or recreate the DB. Reuses the same `synthesizeCallbackEdges`
+   * code path as a full index (D5). Returns the number of synthesized edges.
+   */
+  async rerunSynthesis(): Promise<number> {
+    const count = await this.resolver.rerunSynthesis();
+    const terminal = this.resolver.lastSynthCoverage?.project().terminalState ?? 'degraded';
+    this.queries.setMetadata('index_state', terminal);
+    return count;
   }
 
   /**

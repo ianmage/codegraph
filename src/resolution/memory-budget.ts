@@ -2,6 +2,16 @@
  * Memory headroom for worker-pool sizing — cgroup-honest on Linux,
  * reclaim-honest on macOS.
  *
+ * **Problem domain (S-1): host capacity.** This module answers "how much RAM
+ * does the host/cgroup have?" — NOT "can this isolate afford N bytes?" The
+ * latter is `heap-budget.ts`'s domain (payer authority). Mixing the two is the
+ * #1212 OOM root cause: an admission site asked the host question, the host
+ * read idle-empty, and the paying isolate's headroom was exhausted.
+ *
+ * **Consumer set:** `resolver-pool.ts` (worker-pool sizing) and
+ * `heap-budget.ts` (ceiling derivation's cgroup term). Admission sites that
+ * need isolate authority must use `heap-budget.ts`, not this module.
+ *
  * `os.freemem()` reads /proc/meminfo, which inside a container reports the
  * HOST's (or VM's) memory, not the cgroup's — the same blindness os.cpus()
  * has for cpusets. A resolver pool sized by cores alone OOM-killed a
