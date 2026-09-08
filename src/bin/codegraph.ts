@@ -636,7 +636,30 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
-      clack.log.warn(`Already initialized in ${projectPath}`);
+      // M-3 (Phase 4.2): state-aware dispatch. A `synthesis_incomplete`
+      // index has a committed, queryable base graph but interrupted
+      // synthesis — re-run synthesis only (no re-scan/re-parse/recreate).
+      // Other initialized states: report and direct to `index`/`sync`.
+      const { default: CodeGraph } = await loadCodeGraph();
+      const probe = await CodeGraph.open(projectPath);
+      const state = probe.getIndexState();
+      probe.destroy();
+      if (state === 'synthesis_incomplete') {
+        clack.log.info('Resuming dynamic-dispatch synthesis (the base graph is intact)');
+        const cg = await CodeGraph.open(projectPath);
+        try {
+          await cg.rerunSynthesis();
+          clack.log.success('Synthesis complete');
+        } catch (err) {
+          clack.log.error(`Synthesis failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exitCode = 1;
+        } finally {
+          cg.destroy();
+        }
+        clack.outro('');
+        return;
+      }
+      clack.log.warn(`Already initialized in ${projectPath} (state: ${state ?? 'unknown'})`);
       clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -812,7 +835,17 @@ program
       // enough to trip the liveness watchdog before scanning even began (#1067).
       // recreate() hands back a fresh, empty instance — no clear() needed. For
       // fast incremental updates use `sync`.
-      const cg = await CodeGraph.recreate(projectPath);
+      //
+      // M-3 (Phase 4.2): a `synthesis_incomplete` index has a committed,
+      // queryable base graph — do NOT recreate it. Re-run synthesis only via
+      // the SAME synthesizeCallbackEdges code path (D5). Other states: full
+      // recreate (the existing behavior).
+      const probe = await CodeGraph.open(projectPath);
+      const priorState = probe.getIndexState();
+      probe.destroy();
+      const cg = priorState === 'synthesis_incomplete'
+        ? await CodeGraph.open(projectPath)
+        : await CodeGraph.recreate(projectPath);
 
       // Supervise the indexer: self-terminate if orphaned (parent shim killed)
       // or if the main thread wedges — neither was guarded on this path (#999).
@@ -822,9 +855,14 @@ program
       const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
       try {
         if (options.quiet) {
-          // Quiet mode: no UI, just run against the freshly-recreated graph.
-          const result = await cg.indexAll();
-          if (!result.success) process.exit(1);
+          // Quiet mode: no UI. synthesis_incomplete → synthesis-only rerun;
+          // otherwise a full index against the freshly-recreated graph.
+          if (priorState === 'synthesis_incomplete') {
+            await cg.rerunSynthesis();
+          } else {
+            const result = await cg.indexAll();
+            if (!result.success) process.exit(1);
+          }
           cg.destroy();
           return;
         }
@@ -835,6 +873,11 @@ program
         // A closure so a re-index (after opting gitignored child repos in, #1156)
         // renders identically. Supervision already wraps the whole command.
         const renderIndex = async (): Promise<IndexResult> => {
+          if (priorState === 'synthesis_incomplete') {
+            // M-3: synthesis-only rerun — the base graph is intact, no re-scan.
+            await cg.rerunSynthesis();
+            return { success: true, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [], durationMs: 0 } as IndexResult;
+          }
           if (options.verbose) {
             return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
           }
@@ -1013,9 +1056,11 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
-            // 'complete' | 'partial' (files silently dropped) | 'indexing'
-            // (a run was killed mid-index — the index is truncated) |
-            // 'failed' | null (predates the marker).
+            // 'complete' | 'synthesis_incomplete' (graph committed, synthesis
+            // interrupted — re-run completes synthesis without re-scanning) |
+            // 'degraded' (synthesis left a non-complete pass) | 'partial'
+            // (files silently dropped) | 'indexing' (killed mid-index —
+            // truncated) | 'failed' | null (predates the marker).
             state: indexState,
             // References awaiting resolution. Non-zero at rest means an
             // interrupted resolution pass left edges missing; the next
@@ -1036,6 +1081,18 @@ program
       }
       if (indexState === 'indexing') {
         warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
+      } else if (indexState === 'synthesis_incomplete') {
+        // V-2: the base graph is committed and queryable, but synthesis was
+        // interrupted. Re-running performs synthesis ONLY (no re-scan/re-parse)
+        // — so point the user at `codegraph index`, not a destructive rebuild.
+        warn('The last index finished scanning and resolving, but dynamic-dispatch synthesis was interrupted (killed mid-synthesis?). The graph is queryable but missing some synthesized edges. Re-run "codegraph index" to complete synthesis without re-scanning.');
+      } else if (indexState === 'degraded') {
+        // V-2: synthesis completed but left a non-complete pass (truncated /
+        // skipped-at-scale / failed). The index is queryable; surface WHY it's
+        // degraded, read from the O-3 coverage verdict.
+        const cov = cg.getSynthCoverage();
+        const reason = cov?.reason ?? 'one or more synthesis passes did not complete fully';
+        warn(`The index is queryable but degraded: ${reason}. Dynamic-dispatch coverage is knowingly incomplete; some synthesized edges may be absent.`);
       } else if (indexState === 'partial') {
         warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
       } else if (indexState === 'failed') {

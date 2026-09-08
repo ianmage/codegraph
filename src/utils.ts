@@ -243,18 +243,34 @@ export class FileLock {
         const stat = fs.statSync(this.lockPath);
         const lockAge = Date.now() - stat.mtimeMs;
 
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+        // Liveness-first (M-4): a healthy long synthesis (a single cFnPtr pass
+        // measures 354s) must NOT be preempted by a second writer just because
+        // the lock age exceeded STALE_TIMEOUT_MS (2 min). The old age-AND-
+        // liveness check short-circuited isProcessAlive once over-age, so a
+        // live 354s synthesis had its lock stolen. Now: if the PID is alive,
+        // reject regardless of age; if dead, reclaim regardless of age; only
+        // fall back to age when the PID is unparsable.
+        if (!isNaN(pid) && this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Stale lock: the PID is dead (reclaim regardless of age), or the PID
+        // was unparsable and the lock is past the timeout (reclaim by age).
+        if (isNaN(pid) && lockAge < FileLock.STALE_TIMEOUT_MS) {
+          // Unparsable PID but the lock is young — leave it; a concurrent
+          // writer may be mid-creation. Fall through to the unlink only when
+          // past the timeout.
+          throw new Error(
+            `CodeGraph database is locked by an unidentifiable process (lock at ${this.lockPath} is ${Math.round(lockAge / 1000)}s old). ` +
+            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+          );
+        }
         fs.unlinkSync(this.lockPath);
       } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
+        if (err instanceof Error && err.message.includes('locked by')) {
           throw err;
         }
         // Other errors reading lock file - try to remove it

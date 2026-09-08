@@ -156,7 +156,13 @@ export class ResolverPool {
         readyReject = reject;
       });
       const pw: PoolWorker = { worker, ready, busy: 0 };
-      worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
+      worker.on('message', (msg: {
+        type: string;
+        id?: number;
+        message?: string;
+        edges?: Edge[];
+        ms?: number;
+      } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
           readyResolve();
         } else if (msg.type === 'result' && msg.id !== undefined) {
@@ -317,6 +323,11 @@ export class ResolverPool {
           })
       )
     );
+    // fail() resolves pending recycle waiters to avoid double rejection, so an
+    // error/exit racing the recycle ACK must be re-checked here. Otherwise the
+    // caller would dispatch synthesis into a failed pool and mark every large-
+    // graph pass skipped instead of taking the main-thread fallback.
+    if (this.failed) throw this.failed;
   }
 
   async destroy(): Promise<void> {

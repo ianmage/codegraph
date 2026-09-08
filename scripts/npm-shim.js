@@ -98,12 +98,15 @@ function launcherIn(dir) {
 // --liftoff-only keeps tree-sitter's WASM grammars off V8's turboshaft tier to
 // avoid the Zone OOM on Node >= 22 (issues #293/#298). The unix bin/codegraph
 // launcher already passes it; on Windows we invoke node.exe directly so add it.
+// --max-old-space-size: M-2 derived heap ceiling (static conservative value;
+// the CLI re-derives a cgroup-precise value on the re-exec path). Passed here
+// so the bundled path doesn't need an extra re-exec spawn.
 // --disable-warning=ExperimentalWarning mutes node:sqlite's per-thread
 // "experimental feature" warning, which otherwise prints once per parse worker
 // mid-index, shredding the progress UI. The bundled node.exe is always new
 // enough for both flags.
 function liftoff(entry) {
-  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', entry].concat(process.argv.slice(2));
+  return ['--liftoff-only', '--max-old-space-size=8192', '--disable-warning=ExperimentalWarning', entry].concat(process.argv.slice(2));
 }
 
 // Download + cache the platform bundle from GitHub Releases. Returns

@@ -29,6 +29,8 @@ import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
+import { heapFacts } from './heap-budget';
+import { CoverageVerdict } from './coverage-verdict';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -3616,6 +3618,51 @@ export const SYNTH_PASSES: SynthPassDef[] = [
 /** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
 const FIXED_SYNTH_STEPS = 4;
 export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
+
+/**
+ * O-5 (Phase 2.5): per-pass synthesized-edge output bound. A single pass whose
+ * edge set exceeds this is TRUNCATED to the bound — the excess is dropped and a
+ * `truncated` verdict is recorded (never `complete`). This is the only
+ * remaining unbounded-growth guard after D1 declined to bound the aggregate
+ * ("partial coverage is WORSE than none" — a half-bridged pass must be visible
+ * as degraded, not silently dropped).
+ *
+ * ⚠ PROVISIONAL VALUE — requires the UE5 O-4 measurement (CP1 gate, deferred)
+ * to set from the real per-pass edge distribution. Too high and an OOM moves
+ * inside a single pass; too low and legitimate fan-out (a real command table)
+ * is truncated. The mechanism is complete; final tuning awaits the measured
+ * distribution. Follows the `FANOUT_CAP` (c-fnptr-synthesizer.ts:96) precedent
+ * of a named, tunable cap.
+ */
+const SYNTH_PASS_EDGE_CAP = 50_000;
+
+/**
+ * Apply the per-pass output bound. Returns the (possibly truncated) edge set
+ * and records a `truncated` verdict on `coverage` when the bound bites. The
+ * bound is applied at BOTH the main-thread and pool receive points with the
+ * SAME strategy (C4/I3 — merge order is unaffected because truncation happens
+ * before the dedup-merge, and the capped set is a prefix of the pass's natural
+ * order).
+ */
+function applyPassBound(
+  passName: string,
+  edges: Edge[],
+  coverage: CoverageVerdict
+): Edge[] {
+  if (edges.length <= SYNTH_PASS_EDGE_CAP) {
+    coverage.recordPassOutcome(passName, 'complete', undefined, edges.length);
+    return edges;
+  }
+  const capped = edges.slice(0, SYNTH_PASS_EDGE_CAP);
+  coverage.recordPassOutcome(
+    passName,
+    'truncated',
+    `pass emitted ${edges.length} edges; capped at SYNTH_PASS_EDGE_CAP=${SYNTH_PASS_EDGE_CAP}`,
+    capped.length
+  );
+  return capped;
+}
+
 export async function synthesizeCallbackEdges(
   queries: QueryBuilder,
   ctx: ResolutionContext,
@@ -3623,12 +3670,20 @@ export async function synthesizeCallbackEdges(
   // A live resolver pool to fan the independent passes across (structural type
   // so this file never imports the pool — resolver-worker imports THIS file).
   // Null/omitted → the sequential path, byte-identical to the pool path.
-  pool?: { runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }> } | null,
+  pool?: {
+    runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }>;
+  } | null,
   // WAL-valve writer backstop (WalCheckpointValve.backpressure), called at
   // pool-idle points in the edge-insert loops below — the passes themselves
   // only read; every write in this function happens with the pool idle.
-  backpressure?: () => Promise<void> | null
+  backpressure?: () => Promise<void> | null,
+  // O-3 coverage collector (Phase 3.1 injection). When supplied, each pass's
+  // outcome (complete / truncated / skipped / failed) is recorded on it; the
+  // caller reads `project()` for the terminal verdict. When absent, an internal
+  // instance is used so the bound/truncation mechanism still works.
+  coverage?: CoverageVerdict
 ): Promise<number> {
+  const cov = coverage ?? new CoverageVerdict();
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
   // for well over a minute on a large repo — long enough for the #850 liveness
@@ -3665,14 +3720,27 @@ export async function synthesizeCallbackEdges(
   // Per-pass wall-clock timing to stderr, opt-in via CODEGRAPH_SYNTH_TIMINGS
   // (=1: passes over 250ms; =all: every pass). This is the diagnostic that
   // located both the #1091/#1122 watchdog stalls and the #1212 OOM — keep it.
+  // O-4 (Phase 2.1): each record also carries the pass's EDGE COUNT and the
+  // ISOLATE's heap delta + identity (main/worker). The edge count turns the
+  // "is the aggregate ~10⁴ or ~10⁶?" question from inference into a number
+  // (CP1 gate); the heap delta isolates which pass's live set is growing.
   const markT = { t: Date.now() };
-  const __mark = (label: string): void => {
+  let prevLiveBytes = heapFacts().liveBytes;
+  const emitTiming = (label: string, dt: number, edgeCount: number): void => {
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
+      const f = heapFacts();
+      const heapDelta = f.liveBytes - prevLiveBytes;
+      prevLiveBytes = f.liveBytes;
+      console.error(
+        `[synth-timing] ${label}: ${dt}ms edges=${edgeCount} heapDelta=${heapDelta >= 0 ? '+' : ''}${heapDelta} isolate=${f.isolateKind} heapLimit=${f.limitBytes}`
+      );
+    }
+  };
+  const __mark = (label: string, edgeCount = 0): void => {
     const now = Date.now();
     const dt = now - markT.t;
     markT.t = now;
-    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
-      console.error(`[synth-timing] ${label}: ${dt}ms`);
-    }
+    emitTiming(label, dt, edgeCount);
     passesDone++;
     emit(passesDone);
   };
@@ -3705,7 +3773,8 @@ export async function synthesizeCallbackEdges(
     await yieldToLoop();
     await foldIfOver();
   }
-  await yieldToLoop(); __mark('goMethodContains');
+  await yieldToLoop(); __mark('goMethodContains', goMethodContains.length);
+  cov.recordPassOutcome('goMethodContains', has('go') ? 'complete' : 'skipped', undefined, goMethodContains.length, has('go') ? undefined : 'gated');
 
   // Go implicit `implements` edges must be synthesized AND persisted next: the
   // interface-dispatch bridge below reads `implements` edges from the DB, and
@@ -3717,7 +3786,8 @@ export async function synthesizeCallbackEdges(
     await yieldToLoop();
     await foldIfOver();
   }
-  await yieldToLoop(); __mark('goImplements');
+  await yieldToLoop(); __mark('goImplements', goImpl.length);
+  cov.recordPassOutcome('goImplements', has('go') ? 'complete' : 'skipped', undefined, goImpl.length, has('go') ? undefined : 'gated');
 
   // Run the independent passes (see SYNTH_PASSES). Their results are merged in
   // REGISTRY ORDER below regardless of execution order, and none of their edges
@@ -3728,25 +3798,42 @@ export async function synthesizeCallbackEdges(
   // the worker; a pass that fails on a worker falls back to running on the main
   // thread, so a worker crash isolates to a retry instead of failing synthesis.
   const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
-  const markPass = (label: string, dt: number): void => {
-    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
-      console.error(`[synth-timing] ${label}: ${dt}ms`);
-    }
+  const markPass = (label: string, dt: number, edgeCount = 0): void => {
+    emitTiming(label, dt, edgeCount);
     passesDone++;
     emit(passesDone);
   };
   const runPassOnMain = async (i: number): Promise<void> => {
     const pass = SYNTH_PASSES[i]!;
     const t0 = Date.now();
-    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    let raw: Edge[];
+    try {
+      raw = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    } catch (err) {
+      // V-1 (Phase 3.1): a pass that THROWS leaves a `failed` verdict (E8
+      // closure — previously the throw propagated and the catch in
+      // resolution/index.ts swallowed it with no record, so index_state still
+      // read `complete`). Record and continue; the other passes still run.
+      cov.recordPassOutcome(
+        pass.name, 'failed',
+        `pass threw: ${err instanceof Error ? err.message : String(err)}`, 0
+      );
+      markPass(`${pass.name} (failed)`, Date.now() - t0, 0);
+      return;
+    }
+    passEdges[i] = applyPassBound(pass.name, raw, cov);
     await yieldToLoop();
-    markPass(pass.name, Date.now() - t0);
+    markPass(pass.name, Date.now() - t0, passEdges[i]!.length);
   };
 
   const gatedIn: number[] = [];
   for (let i = 0; i < SYNTH_PASSES.length; i++) {
     if (SYNTH_PASSES[i]!.gate(has)) gatedIn.push(i);
-    else markPass(SYNTH_PASSES[i]!.name, 0);
+    else {
+      // Language-gated out: a provably-empty pass (K4 — does not degrade).
+      cov.recordPassOutcome(SYNTH_PASSES[i]!.name, 'skipped', undefined, 0, 'gated');
+      markPass(SYNTH_PASSES[i]!.name, 0, 0);
+    }
   }
 
   // Above this node count, a pass that OOM-killed its worker must NOT be
@@ -3764,8 +3851,8 @@ export async function synthesizeCallbackEdges(
         const pass = SYNTH_PASSES[i]!;
         try {
           const out = await pool.runSynthPass(pass.name);
-          passEdges[i] = out.edges;
-          markPass(pass.name, out.ms);
+          passEdges[i] = applyPassBound(pass.name, out.edges, cov);
+          markPass(pass.name, out.ms, passEdges[i]!.length);
         } catch (err) {
           if (graphNodes > MAIN_RETRY_MAX_NODES) {
             // Worker died at a scale where the main-thread retry is a process
@@ -3773,7 +3860,11 @@ export async function synthesizeCallbackEdges(
             console.error(
               `[synthesis] pass '${pass.name}' failed on a worker at ${graphNodes} nodes — skipped (edges from this pass are absent): ${err instanceof Error ? err.message : String(err)}`
             );
-            markPass(`${pass.name} (skipped at scale)`, 0);
+            cov.recordPassOutcome(
+              pass.name, 'skipped',
+              `worker OOM at ${graphNodes} nodes`, 0, 'at-scale'
+            );
+            markPass(`${pass.name} (skipped at scale)`, 0, 0);
             return;
           }
           // Worker-side failure (crash, OOM, unknown pass after a version
@@ -3796,7 +3887,7 @@ export async function synthesizeCallbackEdges(
     seen.add(key);
     merged.push(e);
   }
-  __mark('dedupe-merge');
+  __mark('dedupe-merge', merged.length);
   // Chunked insert with yields: on the Linux kernel the merged synthesized
   // edge set is ~275k rows, and one transaction for all of them was a 20s
   // unyielded main-thread span (#1212 follow-up) — the last one in the tail.
@@ -3805,6 +3896,11 @@ export async function synthesizeCallbackEdges(
     await yieldToLoop();
     await foldIfOver();
   }
-  __mark('insertMergedEdges');
+  __mark('insertMergedEdges', merged.length);
+  // Persist the coverage verdict (O-3): per-pass outcomes + terminal state.
+  // Overwrites any prior row (coverage never accumulates). The caller
+  // (resolution/index.ts) reads `project().terminalState` to decide the
+  // `index_state` label — this function does NOT write index_state itself.
+  cov.persist((key, value) => { try { queries.setMetadata(key, value); } catch { /* advisory */ } });
   return merged.length + goImpl.length + goMethodContains.length;
 }

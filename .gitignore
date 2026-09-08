@@ -79,3 +79,8 @@ target-linux/
 .kommandr/kommandr.db
 .kommandr/kommandr.db-wal
 .kommandr/kommandr.db-shm
+
+# Local autonomous-solver state
+/workspace/
+/knowledge/
+/evolution/

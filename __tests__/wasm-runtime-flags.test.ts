@@ -20,6 +20,8 @@ import {
   nodeRuntimeFlagsFor,
   processHasWasmRuntimeFlags,
   buildRelaunchArgv,
+  derivedHeapCeilingMib,
+  heapCeilingFlag,
 } from '../src/extraction/wasm-runtime-flags';
 
 describe('WASM_RUNTIME_FLAGS', () => {
@@ -87,26 +89,32 @@ describe('processHasWasmRuntimeFlags', () => {
 });
 
 describe('buildRelaunchArgv', () => {
-  it('places our flags first, then the script and its args', () => {
-    expect(buildRelaunchArgv('/x/codegraph.js', ['index', '/repo'], [])).toEqual([
+  it('places our flags first (incl. derived ceiling), then the script and its args', () => {
+    const ceiling = heapCeilingFlag();
+    const expected = [
       ...NODE_RUNTIME_FLAGS,
       '--liftoff-only',
+      ...(ceiling ? [ceiling] : []),
       '/x/codegraph.js',
       'index',
       '/repo',
-    ]);
+    ];
+    expect(buildRelaunchArgv('/x/codegraph.js', ['index', '/repo'], [])).toEqual(expected);
   });
 
-  it('preserves other existing node flags without duplicating ours', () => {
+  it('preserves other existing node flags without duplicating ours, and replaces any prior ceiling', () => {
+    const ceiling = heapCeilingFlag();
     expect(
       buildRelaunchArgv('/x/codegraph.js', ['status'], [
         '--liftoff-only',
         ...NODE_RUNTIME_FLAGS,
         '--enable-source-maps',
+        '--max-old-space-size=2048', // a prior/stale ceiling — must be replaced, not duplicated
       ])
     ).toEqual([
       ...NODE_RUNTIME_FLAGS,
       '--liftoff-only',
+      ...(ceiling ? [ceiling] : []),
       '--enable-source-maps',
       '/x/codegraph.js',
       'status',
@@ -126,5 +134,60 @@ describe('buildRelaunchArgv', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Phase 4.1 — M-2 derived heap ceiling', () => {
+  it('derivedHeapCeilingMib returns a positive MiB value (cgroup-aware, hard-clamped)', () => {
+    const mib = derivedHeapCeilingMib();
+    expect(mib).not.toBeNull();
+    expect(mib!).toBeGreaterThan(0);
+    // Hard cap is 8 GiB → 8192 MiB. On an uncontained host the ceiling is the
+    // hard cap; in a cgroup it's ≤ the cgroup limit. Either way ≤ 8192.
+    expect(mib!).toBeLessThanOrEqual(8192);
+  });
+
+  it('heapCeilingFlag returns the --max-old-space-size=N form', () => {
+    const flag = heapCeilingFlag();
+    expect(flag).not.toBeNull();
+    expect(flag).toMatch(/^--max-old-space-size=\d+$/);
+  });
+
+  it('the ceiling flag is a real, accepted node CLI flag', () => {
+    const flag = heapCeilingFlag();
+    expect(flag).not.toBeNull();
+    const res = spawnSync(process.execPath, [flag!, '-e', 'process.exit(0)'], { encoding: 'utf8' });
+    expect(res.status, `node rejected ${flag}:\n${res.stderr}`).toBe(0);
+  });
+
+  it('the re-exec gate does NOT require the ceiling flag (avoids infinite re-exec on a derived value)', () => {
+    // The gate stays on --liftoff-only; the ceiling rides along on the re-exec
+    // the gate already triggers. Gating on the ceiling (a derived value that
+    // varies) would re-exec forever.
+    expect(processHasWasmRuntimeFlags(['--liftoff-only'])).toBe(true);
+    expect(processHasWasmRuntimeFlags(['--liftoff-only', '--max-old-space-size=8192'])).toBe(true);
+  });
+
+  it('no new Worker site gains resourceLimits (C11 — scan the source)', () => {
+    // C11: raising the main isolate's --max-old-space-size covers all workers
+    // (they have no resourceLimits). This module must not add resourceLimits
+    // to any `new Worker` site. Scan for the property-usage pattern
+    // (`resourceLimits:`), which excludes doc-comment mentions.
+    const scan = (dir: string): string[] => {
+      const hits: string[] = [];
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { hits.push(...scan(full)); continue; }
+        if (!/\.ts$/.test(entry.name)) continue;
+        const content = fs.readFileSync(full, 'utf8');
+        // Match `resourceLimits` as a property key (followed by `:`), not a
+        // doc-comment mention (followed by `)` or backtick).
+        if (/resourceLimits\s*:/.test(content)) hits.push(path.relative(path.resolve(__dirname, '..'), full).replace(/\\/g, '/'));
+      }
+      return hits;
+    };
+    const src = path.resolve(__dirname, '..', 'src');
+    const hits = scan(src);
+    expect(hits).toEqual([]);
   });
 });
